@@ -1,14 +1,20 @@
 #include <iostream>
-#include <cmath>
 #include <tuple>
-#include <functional>
 #include <utility>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <future>
+#include <condition_variable>
 
-#include "opencv2/opencv.hpp"
+#include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/opencv.hpp>
+
 #include "torch/torch.h"
 #include "torch/script.h"
+
 
 enum class DetectorStates
 {
@@ -44,14 +50,30 @@ private:
     std::atomic<double> m_YOffset{0};
     std::atomic<double> m_WireWidth{0};
 
-    bool m_CamStreamCap{false};
-    std::atomic<bool> m_WireCap{false};
+    std::future<void>m_ActivityFuture;
+
+    std::atomic<bool> m_Paused{true};
 
     std::thread m_ReaderThread;
 
     cv::VideoWriter m_VideoWriter{};
 
+    cv::VideoCapture m_VideoCapture;
+
+    std::string m_VideoPath;
+
+    cv::String m_NamedWindow{"Wire Detector Video Player"};
+
+    std::atomic<double> m_CurrentFrameIndex{0};
+
+    std::mutex m_ActivityMutex;
+
+    std::condition_variable m_ActivityConditionVariable;
+
     torch::jit::script::Module m_Model;
+
+    bool m_Fullscreen{false};
+
 
     static std::tuple<int, int> GetPointCenterOffset(int frameWidth, int frameHeight, const cv::Point& point)
     {
@@ -62,16 +84,15 @@ private:
         int offset_y = (center_y - point.y) / center_y * 100;
         return std::make_tuple(offset_x, offset_y);
     }
-
     std::tuple<std::vector<std::vector<cv::Point>>, torch::Tensor>  CalculateOffsets(const cv::Mat &frame, int frameWidth, int frameHeight)
     {
         std::tuple<std::vector<std::vector<cv::Point>>, at::Tensor> returned_tuple = DetectWireContours(frame);
         std::vector<std::vector<cv::Point>> contours = std::get<0>(returned_tuple);
         torch::Tensor segmentation = std::get<1>(returned_tuple);
 
-        std::vector<std::vector<cv::Point>> boxes = FindTheLongestBoxes(GetBoxesFromContours(contours));
+        std::vector<std::vector<cv::Point>> boxes;// = FindTheLongestBoxes(GetBoxesFromContours(contours));
 
-        boxes.empty() ? ClearOffsetValues(), m_WireCap = false :  m_WireCap = true;
+        //boxes.empty() ? ClearOffsetValues(), m_WireCap = false :  m_WireCap = true;
 
         for(const auto& box : boxes)
         {
@@ -81,20 +102,10 @@ private:
 
         return std::make_tuple(boxes, segmentation);
     }
-
     std::vector<std::vector<cv::Point>> FindTheLongestBoxes(const std::vector<std::vector<cv::Point>>&boxes)
     {
 
     }
-
-    void ClearOffsetValues()
-    {
-        m_AngleOffset = 0;
-        m_XOffset = 0;
-        m_YOffset = 0;
-        m_WireWidth = 0;
-    }
-
     static std::vector<std::vector<cv::Point>> GetBoxesFromContours(const std::vector<std::vector<cv::Point>> &contours, float relativeThreshold = 0.4f, int noisyRectArea = 8000)
     {
         std::vector<std::vector<cv::Point>> boxes;
@@ -111,20 +122,21 @@ private:
 
     std::tuple<std::vector<std::vector<cv::Point>>, torch::Tensor> DetectWireContours(const cv::Mat &frame, int minContourArea = 50)
     {
-        std::vector<torch::jit::IValue> input;
+        // std::vector<torch::jit::IValue> input;
         // Disable gradient calculation for better performance
         torch::NoGradGuard no_grad;
 
         // Convert frame to torch tensor
-        torch::Tensor frame_tensor = torch::from_blob(frame.data, {1, frame.rows, frame.cols, frame.channels()}, torch::kByte);
-        input.emplace_back(frame_tensor);
+        torch::Tensor tensor_frame = torch::from_blob(frame.data, {1, frame.rows, frame.cols, 3}, torch::kByte);
+        // input.emplace_back(tensor_frame);
         // Running frame tensor through the model
-        torch::Tensor output = torch::sigmoid(m_Model.forward(input).toTensor()).detach().cpu();
+        //torch::Tensor output = torch::sigmoid(m_Model.forward(input).toTensor()).detach().cpu();
+        torch::Tensor output = m_Model.forward({tensor_frame}).toTensor();
 
         // Display segmentation
         torch::Tensor segmentation = (output > 0.5).to(torch::kByte)[0];
 
-        cv::Mat seg_video(segmentation.size(1), segmentation.size(2), CV_8UC1, segmentation.data_ptr());
+        cv::Mat seg_video(segmentation.size(0), segmentation.size(1), CV_8UC1, segmentation.data_ptr());
 
         try
         {
@@ -150,7 +162,7 @@ private:
         std::vector<double> longest_sides;
 
         for (const auto &cnt : contours)
-        {
+        {m_InputThread;
             cv::RotatedRect rect = cv::minAreaRect(cnt);
 
             double contour_area = cv::contourArea(cnt);
@@ -184,102 +196,103 @@ private:
         return std::make_tuple(filtered_contours, segmentation);
     }
 
+    void Initialization()
+    {
+        m_VideoCapture.open(m_VideoPath);
+
+        if (!m_VideoCapture.isOpened())
+            throw std::runtime_error("Could not open a video file");
+
+        cv::namedWindow(m_NamedWindow, cv::WINDOW_NORMAL);
+        m_VideoCapture.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
+        m_VideoCapture.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+        m_Paused = false;
+    }
+
+    void ProcessCamStream(const cv::Mat &frame)
+    {
+        cv::imshow(m_NamedWindow, frame);
+    }
+
     void ReadCamStream()
     {
-        cv::VideoCapture cap{"./videos/3.MOV"};
+        cv::Mat frame;
 
-        if (!cap.isOpened())
+        while (m_VideoCapture.isOpened())
         {
-            std::cout << "Error opening video stream" << std::endl;
-            m_CamStreamCap = false;
-            exit(EXIT_FAILURE);
-        }
+            std::unique_lock<std::mutex>unique_lock(m_ActivityMutex);
+            m_ActivityConditionVariable.notify_all();
+            unique_lock.unlock();
 
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+            if (m_Paused) continue;
 
-        double frame_width = cap.get(cv::CAP_PROP_FRAME_WIDTH);
-        double frame_height = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+            m_VideoCapture >> frame;
 
-        m_CamStreamCap = true;
+            if (frame.empty()) continue;
 
-        frame_width -= 3;
+            ProcessCamStream(frame);
 
-        double current_frame_index{0};
+            int key = cv::waitKey(10);
 
-        bool paused{false};
+            if (key == -1)
+                continue;
 
-        cv::namedWindow("Wire Detector Video Player");
+            else if (key == 27)
+                break;
 
-        while (cap.isOpened())
-        {
+            else if (key == 32)
+                m_Paused = !m_Paused;
 
-            if (!paused)
+            else if(key == 97)
             {
-                cv::Mat frame;
+                m_VideoCapture.set(cv::CAP_PROP_POS_FRAMES, m_VideoCapture.get(cv::CAP_PROP_POS_FRAMES) - 2);
+            }
 
-                cap >> frame;
+            else if(key == 100)
+            {
+                m_VideoCapture.set(cv::CAP_PROP_POS_FRAMES, m_VideoCapture.get(cv::CAP_PROP_POS_FRAMES) + 2);
+            }
 
-                if (frame.empty())
-                {
-                    m_CamStreamCap = 0;
-                    continue;
-                }
+            else if(key == 48)
+            {
+                m_VideoCapture.set(cv::CAP_PROP_POS_FRAMES, 0);
+            }
 
-                cv::Mat image;
-                cv::resize(frame, image, cv::Size(320, 224));
+            else if(key == 'f')
+            {
+                m_Fullscreen = !m_Fullscreen;
 
-                CalculateOffsets(frame, image.cols, image.rows);
-
-                cv::imshow("video", image);
-
-                int key = cv::waitKey(1);
-
-                if (key == -1)
-                    continue;
-
-                else if (key == 27)
-                    throw;
-
-                else if (key == 32)
-                    paused = !paused;
-
-                else if (key == 82 || key == 52)
-                {
-                    current_frame_index = std::max((double)0, current_frame_index - 1);
-                    cap.set(cv::CAP_PROP_POS_FRAMES, current_frame_index);
-                }
-
-                else if (key == 83 || key == 54)
-                {
-                    current_frame_index = std::min(current_frame_index + 1, cap.get(cv::CAP_PROP_FRAME_COUNT) - 1);
-
-                    cap.set(cv::CAP_PROP_POS_FRAMES, current_frame_index);
-                }
-
-                current_frame_index++;
+                if (m_Fullscreen)
+                    cv::setWindowProperty(m_NamedWindow, cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
+                else
+                    cv::setWindowProperty(m_NamedWindow, cv::WND_PROP_FULLSCREEN, cv::WINDOW_NORMAL);
             }
         }
 
-        cap.release();
+        //FIX IT!!!!!
         cv::destroyAllWindows();
+        m_VideoCapture.release();
+        Stop();
+        exit(EXIT_SUCCESS);
+    }
+
+    void ClearOffsetValues()
+    {
+        m_AngleOffset = 0;
+        m_XOffset = 0;
+        m_YOffset = 0;
+        m_WireWidth = 0;
     }
 
 public:
-    explicit WireDetector(std::string  path) : m_WeightsPath(std::move(path))
+    explicit WireDetector(std::string  weightsPath, std::string videoPath) noexcept: m_WeightsPath(std::move(weightsPath)), m_VideoPath{std::move(videoPath)}
     {
-        try
-        {
-            m_Model = LoadModel(m_WeightsPath);
-        }
+        m_Model = LoadModel(m_WeightsPath);
+        Initialization();
 
-        catch(const std::exception& exception)
-        {
-            std::cerr << "ERROR: Model did not load:\n Error message:" << exception.what() << std::endl;
-            exit(EXIT_FAILURE);
-        }
+        std::cout << "Model loaded" << std::endl;
 
-        std::cout << "Model loaded";
+        std::cout << "Initialization success" << std::endl;
     }
 
     void Start()
@@ -288,7 +301,6 @@ public:
             return;
 
         m_State = DetectorStates::ON;
-
         m_ReaderThread = std::thread([this]{ ReadCamStream();});
         m_ReaderThread.detach();
     }
@@ -299,35 +311,51 @@ public:
             return;
         ClearOffsetValues();
         m_State = DetectorStates::OFF;
+        m_Paused = true;
     }
 
     void Log()
     {
-        std::cout << "Detector values: " << std::endl << std::endl;
-        std::cout << "Wire captured: " <<  m_WireCap << std::endl;
-        std::cout << "Angle offset: " << m_AngleOffset << std::endl;
-        std::cout << "X offset: " << m_XOffset << std::endl;
-        std::cout << "Y offset: " << m_XOffset << std::endl;
-        std::cout << "Wire width: " << m_WireWidth << std::endl;
+        std::cout << "\nDetector values:" << std::endl;
+        std::cout << "┌─────────────┐" << std::endl;
+        std::cout << "│ Angle offset│ " << std::setw(10) << m_AngleOffset << " │" << std::endl;
+        std::cout << "├─────────────┤" << std::endl;
+        std::cout << "│ X offset    │ " << std::setw(10) << m_XOffset << " │" << std::endl;
+        std::cout << "├─────────────┤" << std::endl;
+        std::cout << "│ Y offset    │ " << std::setw(10) << m_YOffset << " │" << std::endl;
+        std::cout << "├─────────────┤" << std::endl;
+        std::cout << "│ Wire width  │ " << std::setw(10) << m_WireWidth << " │" << std::endl;
+        std::cout << "└─────────────┘" << std::endl;
+    }
+
+    void IsActive(const std::chrono::seconds& howMuchToWait = std::chrono::seconds(1))
+    {
+        std::unique_lock<std::mutex> unique_lock(m_ActivityMutex);
+
+        if(m_ActivityConditionVariable.wait_for(unique_lock, howMuchToWait) == std::cv_status::timeout)
+            throw std::runtime_error("Wire detector is not responding");
     }
 };
 
 int main()
 {
-    const std::string path{" "};
-    WireDetector wire_detector(path);
+    const std::string weights_path{" "};
+    const std::string video_path{"../videos/wire_on_blue_sky_picamera.mp4"};
+    WireDetector wire_detector(weights_path, video_path);
     wire_detector.Start();
 
     while(true)
     {
         try
         {
+            wire_detector.IsActive(std::chrono::seconds(5));
             wire_detector.Log();
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
 
         catch(std::exception& exception)
         {
+            std::cerr << exception.what() << std::endl;
             wire_detector.Stop();
             exit(EXIT_FAILURE);
         }
